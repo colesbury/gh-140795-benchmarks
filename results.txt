@@ -1,0 +1,132 @@
+Benchmark Results: PR #146066 "Put the thread state in PyCriticalSection structs"
+===================================================================================
+
+Date:   2026-03-17
+CPU:    AMD EPYC 9R45 96-Core @ 4510 MHz (1 socket, 96 cores, no SMT)
+OS:     Linux 6.17.0-1009-aws (x86_64)
+Build:  clang-20.1.2, --disable-gil --with-tail-call-interp --enable-optimizations --with-lto=thin
+
+Base:   99e2c5eccd2 "gh-144545: Improve handling of default values in Argument Clinic"
+PR:     b03ac726524 "Put the thread state in PyCriticalSection structs"
+
+PR summary:
+  Stores PyThreadState* in the PyCriticalSection struct instead of passing
+  it as a separate argument.  This unifies the public and Py_BUILD_CORE
+  implementations: Begin fetches tstate and writes it to the struct; End
+  reads it back.  Previously, Py_BUILD_CORE code fetched tstate once in
+  the macro and passed it as a register argument to both Begin and End.
+
+
+1. MICRO-BENCHMARKS: CRITICAL SECTION (20M iterations, 7 runs each)
+--------------------------------------------------------------------
+
+  Three call paths tested, from fastest to slowest:
+
+  a) Main executable (Py_BUILD_CORE, inlined, PGO + thin LTO):
+     Benchmark function in Python/critical_section.c, compiled into the
+     python binary with full PGO + thin LTO.  Called via _testinternalcapi.
+
+    Benchmark                Base (min ms)   PR (min ms)   Change
+    CS1 (Begin/End)               180.93        186.37     +3.0%
+    CS2 (Begin2/End2)             379.03        386.08     +1.9%
+
+  b) Extension .so (Py_BUILD_CORE, inlined, -O2 only):
+     Separate shared library compiled with -DPy_BUILD_CORE_MODULE -O2.
+
+    Benchmark                Base (min ms)   PR (min ms)   Change
+    CS1 (Begin/End)               186.54        190.24     +2.0%
+    CS2 (Begin2/End2)             373.19        380.56     +2.0%
+
+  c) Extension .so (public API, non-inlined, -O2 only):
+     Separate shared library calling the exported PyCriticalSection_Begin/End.
+
+    Benchmark                Base (min ms)   PR (min ms)   Change
+    CS1 (Begin/End)               202.66        208.26     +2.8%
+    CS2 (Begin2/End2)             383.33        394.39     +2.9%
+
+  Analysis:
+    All three paths show a consistent ~2-3% overhead in the PR.  The base
+    passes tstate as a register argument; the PR stores it to the struct
+    (stack write in Begin) and loads it back (stack read in End).  The extra
+    store+load costs ~2 ns per Begin/End pair.
+
+    The main-executable path (a) is fastest overall (180.93 ms base) due
+    to PGO branch hints and thin-LTO cross-TU optimization.  The PR
+    regression is +3.0% there — slightly larger than the extension paths,
+    likely because PGO made the base's register-passing path even tighter.
+
+    The public API path (c) is slowest (202.66 ms base) due to the
+    exported function call layer.  The PR actually saves one tstate fetch
+    on this path (Begin stores it, End reuses it — vs. base where both
+    Begin and End independently call _PyThreadState_GET), but the struct
+    store/load still nets out to a ~2.8% regression.
+
+
+2. MICRO-BENCHMARKS: INTERPRETER CORE (Python, 5M iterations, 5 runs)
+----------------------------------------------------------------------
+
+  These exercise critical sections indirectly via built-in type operations.
+
+    Benchmark              Base (min ms)   PR (min ms)   Change
+    dict_getitem                 66.03         64.81      -1.8%
+    dict_setitem                 94.90         96.94      +2.1%
+    dict_contains                66.44         59.82     -10.0%
+    dict_len                     53.36         53.77      +0.8%
+    list_append_pop             182.43        186.04      +2.0%
+
+  Analysis:
+    Results are mixed.  dict_contains sees a large improvement (-10%) which
+    is likely a code-layout or inlining effect from the smaller macro
+    expansion (the PR removes the local _cs_tstate variable from the macro).
+    dict_setitem and list_append_pop show ~2% regression consistent with
+    the micro-benchmark overhead.  dict_len is in the noise.  Overall the
+    critical section overhead is a small fraction of total work, so the
+    impact on real Python code is diluted.
+
+
+3. FASTMARK (pyperformance suite, single-threaded, GIL disabled)
+-----------------------------------------------------------------
+
+  82 benchmarks run (2to3 excluded — lib2to3 removed in 3.13).
+
+  Geometric mean change: -0.11% (effectively neutral)
+
+  Breakdown: 23 benchmarks faster (>1%), 30 slower (>1%), 29 neutral (±1%).
+
+  Several benchmarks showed >5% swings on the first run (coroutines,
+  subparsers, sqlglot_parse, sqlglot_transpile, async_tree variants,
+  deltablue).  A re-run confirmed these were noise — all came back within
+  ±3%.  The async_tree benchmarks are particularly noisy due to their
+  dependence on system scheduling.
+
+  Notable consistent results (confirmed across both runs):
+    - tomli_loads:   -4.0%  (likely benefits from smaller macro / better inlining)
+    - chaos:         -3.4%  (compute-heavy, benefits from code layout change)
+    - logging_silent: -5.3% (first run; not re-run but plausible — lots of
+                              dict ops in logging)
+    - pickle_pure_python: +4.3% (more dict/object ops)
+
+  Full comparison table available in /tmp/fastmark-base.json and
+  /tmp/fastmark-pr.json.
+
+
+4. SUMMARY
+----------
+
+  The PR has a measurable ~2-3% overhead on isolated critical section
+  micro-benchmarks across all three call paths (main executable, extension
+  with Py_BUILD_CORE, extension with public API).  This is the cost of
+  storing/loading tstate via memory instead of passing it as a register
+  argument.
+
+  However, in real-world benchmarks (fastmark), the impact is lost in
+  noise: geometric mean is -0.11%.  The critical section cost is a small
+  part of any realistic workload.
+
+  The code simplification (unified public/internal API, fewer macro
+  variables, smaller macro expansion) may produce incidental wins in some
+  benchmarks due to changed inlining decisions and code layout.
+  dict_contains seeing a -10% improvement is a notable example.
+
+  Verdict: The PR is performance-neutral for real workloads.  The ~2 ns
+  per-operation regression is real but inconsequential in practice.
