@@ -1,0 +1,105 @@
+diff --git a/Modules/_testinternalcapi.c b/Modules/_testinternalcapi.c
+index e1acce8f586..85439fe6172 100644
+--- a/Modules/_testinternalcapi.c
++++ b/Modules/_testinternalcapi.c
+@@ -2838,6 +2838,33 @@ test_threadstate_set_stack_protection(PyObject *self, PyObject *Py_UNUSED(args))
+ }
+ 
+ 
++/* Thin wrappers around benchmark functions in Python/critical_section.c
++ * which is part of libpython (compiled with PGO + LTO). */
++extern double _PyCriticalSection_BenchCS1(PyObject *op, int iterations);
++extern double _PyCriticalSection_BenchCS2(PyObject *op1, PyObject *op2, int iterations);
++
++static PyObject *
++_testinternalcapi_bench_critical_section(PyObject *self, PyObject *args)
++{
++    PyObject *obj;
++    int iterations;
++    if (!PyArg_ParseTuple(args, "Oi", &obj, &iterations))
++        return NULL;
++    double elapsed = _PyCriticalSection_BenchCS1(obj, iterations);
++    return PyFloat_FromDouble(elapsed);
++}
++
++static PyObject *
++_testinternalcapi_bench_critical_section2(PyObject *self, PyObject *args)
++{
++    PyObject *obj1, *obj2;
++    int iterations;
++    if (!PyArg_ParseTuple(args, "OOi", &obj1, &obj2, &iterations))
++        return NULL;
++    double elapsed = _PyCriticalSection_BenchCS2(obj1, obj2, iterations);
++    return PyFloat_FromDouble(elapsed);
++}
++
+ static PyMethodDef module_functions[] = {
+     {"get_configs", get_configs, METH_NOARGS},
+     {"get_eval_frame_stats", get_eval_frame_stats, METH_NOARGS, NULL},
+@@ -2959,6 +2986,8 @@ static PyMethodDef module_functions[] = {
+     {"module_get_gc_hooks", module_get_gc_hooks, METH_O},
+     {"test_threadstate_set_stack_protection",
+      test_threadstate_set_stack_protection, METH_NOARGS},
++    {"bench_critical_section", _testinternalcapi_bench_critical_section, METH_VARARGS},
++    {"bench_critical_section2", _testinternalcapi_bench_critical_section2, METH_VARARGS},
+     {NULL, NULL} /* sentinel */
+ };
+ 
+diff --git a/Python/critical_section.c b/Python/critical_section.c
+index 818176f2752..92bcc54052e 100644
+--- a/Python/critical_section.c
++++ b/Python/critical_section.c
+@@ -1,4 +1,5 @@
+ #include "Python.h"
++#include <time.h>
+ 
+ #include "pycore_critical_section.h"
+ #include "pycore_interp.h"
+@@ -150,6 +151,47 @@ _PyCriticalSection_Resume(PyThreadState *tstate)
+ #endif
+ }
+ 
++/* Benchmark: tight loop of Py_BEGIN/END_CRITICAL_SECTION.
++ * Placed before the #undef so the macros resolve to the inlined path.
++ * This is compiled into libpython with full PGO + LTO. */
++__attribute__((visibility("default"), used))
++double
++_PyCriticalSection_BenchCS1(PyObject *op, int iterations)
++{
++#ifdef Py_GIL_DISABLED
++    struct timespec start, end;
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    for (int i = 0; i < iterations; i++) {
++        Py_BEGIN_CRITICAL_SECTION(op);
++        Py_END_CRITICAL_SECTION();
++    }
++    clock_gettime(CLOCK_MONOTONIC, &end);
++    return (double)(end.tv_sec - start.tv_sec)
++         + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
++#else
++    return 0.0;
++#endif
++}
++
++__attribute__((visibility("default"), used))
++double
++_PyCriticalSection_BenchCS2(PyObject *op1, PyObject *op2, int iterations)
++{
++#ifdef Py_GIL_DISABLED
++    struct timespec start, end;
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    for (int i = 0; i < iterations; i++) {
++        Py_BEGIN_CRITICAL_SECTION2(op1, op2);
++        Py_END_CRITICAL_SECTION2();
++    }
++    clock_gettime(CLOCK_MONOTONIC, &end);
++    return (double)(end.tv_sec - start.tv_sec)
++         + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
++#else
++    return 0.0;
++#endif
++}
++
+ #undef PyCriticalSection_Begin
+ void
+ PyCriticalSection_Begin(PyCriticalSection *c, PyObject *op)
